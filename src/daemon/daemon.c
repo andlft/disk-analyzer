@@ -1,3 +1,4 @@
+#include "job.h"
 #include <common/ipc.h>
 #include <common/utils.h>
 #include <pthread.h>
@@ -10,30 +11,22 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#define MAX_THREADS            100 // danger
-#define MAX_CHILDREN           100 // danger
-#define JOB_STATUS_IN_PROGRESS 0
-#define JOB_STATUS_REMOVED     1
-#define JOB_STATUS_PAUSED      2
-#define JOB_STATUS_DONE        3
-
-struct Directory {
-    char *path;                               // path to this directory
-    struct Directory *children[MAX_CHILDREN]; // children directories
-    // Change unit of measurement for folders?
-    uint64_t bytes; // size of folder
-    // number of files at this level, not counting grandchildren !!
-    uint64_t file_count;
-};
-struct Job // este Misu <3
-{
-    pthread_t thread;
-    int8_t status; // status of job -> in progress(0), done(1), removed(3), paused(2)
-    struct Directory *root; // children directories
-};
+#define MAX_THREADS  100
+#define MAX_CHILDREN 100
 
 static uint64_t job_count = 0;
-struct Job job_history[MAX_THREADS];
+
+struct Job *jobs[MAX_THREADS];
+
+/**
+ * Finds the job associated with the given id.
+ * Returns NULL on error.
+ */
+struct Job *find_job_by_id(int64_t id) {
+    if (id >= 0 && id < job_count)
+        return jobs[id];
+    return NULL;
+}
 
 int bind_socket() {
     struct sockaddr_un address;
@@ -53,51 +46,97 @@ int bind_socket() {
     return fd;
 }
 
-void pretty_print_job(){};
-
-int remove_job(int64_t id) {
-    struct Job *this_job = &job_history[id];
-    if (this_job->status != JOB_STATUS_DONE) {
-        if (kill(this_job->thread, SIGTERM) < 0) {
-            return -1;
-        }
+int8_t get_job_results(struct Job *job, struct ByteArray *result) {
+    if (job->status != JOB_STATUS_DONE) {
+        return -2;
     }
-    this_job->status = JOB_STATUS_REMOVED;
+
+    int8_t exit_code = 0;
+    int64_t entry_count = job->total_subdir_count + 1;
+
+    // Calculate necessary space for the serialization
+    size_t serialized_len =
+        sizeof(exit_code) + sizeof(entry_count) + job->total_path_len +
+        entry_count * (sizeof(int64_t) + sizeof(job->root->bytes));
+
+    bytearray_init(result, serialized_len);
+
+    char *ptr = result->bytes;
+    memcpy(ptr, &exit_code, sizeof(exit_code));
+    ptr += sizeof(exit_code);
+
+    memcpy(ptr, &entry_count, sizeof(entry_count));
+    ptr += sizeof(entry_count);
+
+    directory_serialize(job->root, ptr);
+
     return 0;
 }
 
-int resume_job(int64_t id) {
-    struct Job *this_job = &job_history[id];
-    if (kill(this_job->thread, SIGCONT) < 0) {
-        return -1;
-    }
-    this_job->status = JOB_STATUS_IN_PROGRESS;
+int get_job_info(struct Job *job, struct ByteArray *result) {
+    int64_t payload_len = sizeof(/* exit code */ int8_t) +
+                          sizeof(/* job id */ int64_t) + job_serialized_size(job);
+
+    bytearray_init(result, payload_len);
+
+    // Leave space for the error code and job id
+    char *buf = result->bytes + sizeof(int8_t) + sizeof(int64_t);
+    job_info_serialize(job, buf);
+
     return 0;
 }
 
-int pause_job(int64_t id) {
-    struct Job *this_job = &job_history[id];
-    if (this_job->status != JOB_STATUS_DONE) {
+int list_jobs(struct ByteArray *result) {
+    // Leave space for the exit code and the entry count
+    int64_t entry_count = 0;
+    int64_t total_bufsize = sizeof(/* exit code */ int8_t) + sizeof(entry_count);
 
-        if (kill(this_job->thread, SIGSTOP) < 0) {
-            return -1;
-        }
-        this_job->status = JOB_STATUS_PAUSED;
+    // Measure required buffer size
+    for (int64_t job_id = 0; job_id < job_count; ++job_id) {
+        struct Job *job = find_job_by_id(job_id);
+        if (job == NULL || job->status == JOB_STATUS_REMOVED)
+            continue;
+
+        total_bufsize += sizeof(/* job id */ int64_t) + job_serialized_size(job);
+        ++entry_count;
     }
+
+    bytearray_init(result, total_bufsize);
+
+    char *ptr = result->bytes + sizeof(/* exit code */ int8_t);
+    memcpy(ptr, &entry_count, sizeof(entry_count));
+    ptr += sizeof(entry_count);
+
+    // Add entries to buffer
+    for (int64_t job_id = 0; job_id < job_count; ++job_id) {
+        struct Job *job = find_job_by_id(job_id);
+        if (job == NULL || job->status == JOB_STATUS_REMOVED)
+            continue;
+
+        memcpy(ptr, &job_id, sizeof(job_id));
+        ptr += sizeof(job_id);
+        ptr = job_info_serialize(job, ptr);
+    }
+
     return 0;
-} // mmove to new file?
+}
+/**
+ * Returns the id of the job containing the path, and -1 if no such job is found.
+ */
+int64_t find_job_containing_path(const char *path) {
+    for (int64_t job_id = 0; job_id < job_count; job_id++) {
+        struct Job *job = find_job_by_id(job_id);
+        if (job == NULL || job->status == JOB_STATUS_REMOVED) {
+            continue;
+        }
 
-int print_done_jobs() {
-    for (size_t i = 0; i < job_count; i++) {
-        if (job_history[i].status == JOB_STATUS_DONE) {
-            pretty_print_job(i);
+        if (strstr(path, job->root->path) != NULL) {
+            return job_id;
         }
     }
+
+    return -1;
 }
-
-int get_job_info(int64_t id) {}
-
-int list_jobs() {}
 
 /**
  * Creates a job and returns its id through the job_id argument.
@@ -105,48 +144,154 @@ int list_jobs() {}
  * Errors: -1 if path does not exist
  *         -2 if path is part of an existing job (the returned job_id)
  */
-int create_job(const char *path, int8_t priority, int64_t *job_id) {}
+int8_t create_job(const char *path, int8_t priority, int64_t *job_id) {
+    int path_result = exists_dir(path);
+    if (path_result < 1) {
+        if (path_result < 0) {
+            perror("Path check");
+        }
+        return -1;
+    }
 
-int handle_ipc_cmd(int8_t cmd, struct ByteArray *payload) {
+    *job_id = find_job_containing_path(path);
+    if (*job_id >= 0) {
+        return -2;
+    }
+
+    struct Job *new_job = da_malloc(sizeof(*new_job));
+    job_init(new_job);
+    new_job->priority = priority;
+
+    struct TraverseArgs *args = da_malloc(sizeof(*args));
+
+    size_t path_len = strlen(path);
+    args->path = da_malloc((path_len + 1) * sizeof(*args->path));
+    strncpy(args->path, path, path_len);
+    args->path[path_len] = 0;
+
+    args->job = new_job;
+
+    *job_id = job_count;
+    ++job_count;
+
+    jobs[*job_id] = new_job;
+
+    // Create thread
+
+    // Set thread priority
+    pthread_attr_t tattr;
+    if (pthread_attr_init(&tattr) < 0) {
+        perror("pthread_attr_init");
+        return -128;
+    }
+
+    struct sched_param param;
+    if (pthread_attr_getschedparam(&tattr, &param) < 0) {
+        perror("pthread_attr_getschedparam");
+        return -128;
+    }
+
+    param.sched_priority = priority;
+
+    if (pthread_attr_setschedparam(&tattr, &param) < 0) {
+        perror("pthread_attr_setschedparam");
+        return -128;
+    }
+
+    if (pthread_create(&new_job->thread, &tattr, traverse, (void *)args) < 0) {
+        perror("pthread_create");
+        return -128;
+    }
+
+    return 0;
+}
+
+int handle_ipc_cmd(int8_t cmd, struct ByteArray *payload, struct ByteArray *reply) {
     // TODO: Handle reply, errors
+    int8_t exit_code = 0;
+
     if (cmd == CMD_ADD) {
         if (payload->len <= 0) {
             // TODO: Generic bad input error
-            return -255;
+            return -128;
         }
 
         int8_t priority = payload->bytes[0];
         // Read path
-        char *path = da_malloc((payload->len + 1) * sizeof(char));
-        strncpy(path, payload->bytes, payload->len);
+        int64_t path_len = payload->len - 1;
+        char *path = da_malloc((path_len + 1) * sizeof(*path));
+        strncpy(path, payload->bytes + 1, path_len);
         // Null terminate
-        path[payload->len] = 0;
+        path[path_len] = 0;
 
         int64_t job_id;
-        int8_t code = create_job(path, priority, &job_id);
+        exit_code = create_job(path, priority, &job_id);
 
         free(path);
-    } else if (cmd == CMD_PRINT) {
-        print_done_jobs();
+        exit_code = -exit_code;
+
+        // Set reply payload
+        int64_t reply_len = sizeof(exit_code);
+        if (exit_code == 0 || exit_code == 2) {
+            reply_len += sizeof(job_id);
+        }
+        bytearray_init(reply, reply_len);
+
+        memcpy(reply->bytes, &exit_code, sizeof(exit_code));
+        if (exit_code == 0 || exit_code == 2) {
+            memcpy(reply->bytes + sizeof(exit_code), &job_id, sizeof(job_id));
+        }
     } else if (cmd == CMD_LIST) {
-        list_jobs();
+        list_jobs(reply);
+        exit_code = 0;
+        memcpy(reply->bytes, &exit_code, sizeof(exit_code));
     } else {
         int64_t job_id;
         if (payload->len != sizeof(job_id)) {
-            return -255;
+            return -128;
         }
 
         // Read job_id
         memcpy(&job_id, payload->bytes, sizeof(job_id));
 
+        struct Job *job;
+        if ((job = find_job_by_id(job_id)) == NULL) {
+            // Job not found
+            exit_code = 1;
+            bytearray_init(reply, sizeof(exit_code));
+            memcpy(reply->bytes, &exit_code, sizeof(exit_code));
+            return 0;
+        }
+
         if (cmd == CMD_SUSPEND) {
-            pause_job(job_id);
+            pause_job(job);
+            exit_code = 0;
+            bytearray_init(reply, sizeof(exit_code));
+            memcpy(reply->bytes, &exit_code, sizeof(exit_code));
+
         } else if (cmd == CMD_REMOVE) {
-            remove_job(job_id);
+            remove_job(job);
+            exit_code = 0;
+            bytearray_init(reply, sizeof(exit_code));
+            memcpy(reply->bytes, &exit_code, sizeof(exit_code));
+
         } else if (cmd == CMD_RESUME) {
-            resume_job(job_id);
+            resume_job(job);
+            exit_code = 0;
+            bytearray_init(reply, sizeof(exit_code));
+            memcpy(reply->bytes, &exit_code, sizeof(exit_code));
+
         } else if (cmd == CMD_INFO) {
-            get_job_info(job_id);
+            get_job_info(job, reply);
+            memcpy(reply->bytes, &exit_code, sizeof(exit_code));
+            memcpy(reply->bytes + sizeof(exit_code), &job_id, sizeof(job_id));
+
+        } else if (cmd == CMD_PRINT) {
+            exit_code = -get_job_results(job, reply);
+            if (exit_code != 0) {
+                bytearray_init(reply, sizeof(exit_code));
+                memcpy(reply->bytes, &exit_code, sizeof(exit_code));
+            }
         } else {
             return -1;
         }
@@ -182,9 +327,17 @@ void *monitor_ipc(void *vserverfd) {
             continue;
         }
 
-        handle_ipc_cmd(cmd, &payload);
+        struct ByteArray reply;
+
+        handle_ipc_cmd(cmd, &payload, &reply);
+
+        if (write(clientfd, reply.bytes, reply.len) < 0) {
+            perror("IPC reply");
+            continue;
+        }
 
         bytearray_destroy(&payload);
+        bytearray_destroy(&reply);
     }
 }
 

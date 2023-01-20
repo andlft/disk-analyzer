@@ -3,15 +3,26 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 int min(int a, int b);
 
 int max(int a, int b);
 
 /**
+ * Print `str` `count` times to the stream.
+ */
+int fputs_repeated(const char *restrict str, FILE *restrict stream, int count);
+
+/**
  * malloc that exits on error
  */
 void *da_malloc(size_t size);
+
+/**
+ * Returns 1 if path exists, 0 if it does not, and -1 for error.
+ */
+int exists_dir(const char *path);
 
 struct ByteArray {
     int64_t len;
